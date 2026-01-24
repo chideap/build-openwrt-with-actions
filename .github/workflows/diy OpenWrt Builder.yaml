@@ -1,0 +1,176 @@
+name: diy OpenWrt Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: '仓库'
+        required: true
+        default: 'openwrt/openwrt'
+        type: string
+      source_branch:
+        description: '分支'
+        required: true
+        default: 'openwrt-25.12'
+        type: string
+      custom_feeds:
+        description: '软件源（src-git luci https://github.com/openwrt/luci.git）'
+        required: false
+        default: ''
+        type: string
+      target:
+        description: '架构'
+        required: true
+        default: 'airoha'
+        type: string
+      subtarget:
+        description: '芯片'
+        required: true
+        default: 'an7581'
+        type: string
+      profile:
+        description: '配置'
+        required: true
+        default: 'nokia_xg-040g-md'
+        type: string
+      packages:
+        description: '软件（使用空格分隔）'
+        required: false
+        default: 'luci luci-app-minidlna luci-app-ksmbd'
+        type: string
+      ssh:
+        description: "使用 ssh 连接到编译环境"
+        type: boolean
+        default: false
+
+jobs:
+  build-firmware:
+    name: 构建 ${{ github.event.inputs.profile }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    permissions:
+      contents: write
+
+    steps:
+    - name: 初始化环境
+      run: |
+        echo "BUILD_TIME=$(date +%Y%m%d%H%M%S)" >> $GITHUB_ENV
+        echo "TARGET=${{ github.event.inputs.target }}" >> $GITHUB_ENV
+        echo "SUBTARGET=${{ github.event.inputs.subtarget }}" >> $GITHUB_ENV
+        echo "PROFILE=${{ github.event.inputs.profile }}" >> $GITHUB_ENV
+        sudo mkdir -p /mnt/openwrt
+        sudo chown -R runner:runner /mnt/openwrt
+
+    - name: 检出源码
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ github.event.inputs.source_repo }}
+        ref: ${{ github.event.inputs.source_branch }}
+
+    - name: 移动源码
+      run: |
+        mv ${{ github.workspace }} /mnt/openwrt/openwrt-src
+        ln -sfn /mnt/openwrt/openwrt-src ${{ github.workspace }}
+
+    - name: 自定义软件源
+      if: github.event.inputs.custom_feeds != ''
+      run: |
+        cd /mnt/openwrt/openwrt-src
+        echo "${{ github.event.inputs.custom_feeds }}" | sed '/^$/d' >> feeds.conf.default
+
+    - name: 安装编译工具
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential ccache ecj fastjar file g++ gawk gettext git default-jre-headless libacl1-dev libcap-dev libelf-dev libffi-dev libgmp-dev libisl-dev libjansson-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libpython3.12-dev libssl-dev libtool libz-dev python3 python3-distutils python3-setuptools python3-pip python3.12 python3.12-dev rsync subversion swig time unzip wget zlib1g-dev libxml-parser-perl liblzma-dev liblzo2-dev zstd libzstd-dev libjson-c-dev libfuse-dev libpcre2-dev libpcre3-dev || true
+
+    - name: 更新feeds
+      run: |
+        cd /mnt/openwrt/openwrt-src
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: 生成配置
+      run: |
+        cd /mnt/openwrt/openwrt-src
+        set -e
+        
+        echo "CONFIG_TARGET_${TARGET}=y" >> .config
+        echo "CONFIG_TARGET_${TARGET}_${SUBTARGET}=y" >> .config
+        echo "CONFIG_TARGET_${TARGET}_${SUBTARGET}_DEVICE_${PROFILE}=y" >> .config
+        
+        if [ -n "${{ github.event.inputs.packages }}" ]; then
+          CLEANED_PACKAGES=$(echo "${{ github.event.inputs.packages }}" | xargs)
+          
+          for pkg in $CLEANED_PACKAGES; do
+            [ -z "$pkg" ] && continue
+            
+            echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+            
+            if [[ "$pkg" == luci-app-* ]]; then
+              app_name="${pkg#luci-app-}"
+              zh_cn_pkg="luci-i18n-${app_name}-zh-cn"
+              echo "CONFIG_PACKAGE_${zh_cn_pkg}=y" >> .config
+            fi
+          done
+        fi
+        
+        make defconfig
+        
+        echo "=== 配置差异 (diffconfig) ==="
+        ./scripts/diffconfig.sh
+        
+        echo ""
+        echo "=== 列出所有 ==="
+        grep '=y$' .config
+
+    - name: 使用ssh连接编译环境限时15分钟,可在连接后输入命令 `touch /tmp/keepalive` 保活
+        if: ${{inputs.ssh == true}}
+        uses: csexton/debugger-action@master
+
+    - name: 启用ssh生成了.config后在编译前上传配置
+        if: ${{inputs.multithreading == true}}
+        uses: actions/upload-artifact@v4
+        with:
+          name: config-before-build
+          path: |
+            openWRT/.config
+            openWRT/feeds.conf.default
+          include-hidden-files: true
+
+    - name: 编译固件
+      run: |
+        cd /mnt/openwrt/openwrt-src
+        set -e
+        make download -j$(nproc) || make download -j1 V=s
+        make -j$(nproc) V=sc || make -j1 V=s
+
+    - name: 准备发布文件
+      if: success()
+      run: |
+        mkdir -p ${{ github.workspace }}/release_assets
+        cp -r /mnt/openwrt/openwrt-src/bin/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}/* ${{ github.workspace }}/release_assets/
+
+    - name: 上传固件
+      if: success()
+      uses: actions/upload-artifact@v4
+      with:
+        name: openwrt-${{ env.PROFILE }}-${{ env.BUILD_TIME }}
+        path: ${{ github.workspace }}/release_assets/
+        retention-days: 1
+
+    - name: 创建发布
+      if: success()
+      uses: softprops/action-gh-release@v2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: openwrt-${{ env.PROFILE }}-${{ env.BUILD_TIME }}
+        name: OpenWrt ${{ env.PROFILE }} ${{ env.BUILD_TIME }}
+        body: |
+          设备: ${{ env.PROFILE }}
+          架构: ${{ env.TARGET }}/${{ env.SUBTARGET }}
+          软件: ${{ github.event.inputs.packages }}
+        files: ${{ github.workspace }}/release_assets/*
+        draft: false
+        prerelease: false
+        overwrite_files: true
